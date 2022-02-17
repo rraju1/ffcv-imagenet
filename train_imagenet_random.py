@@ -1,3 +1,4 @@
+from email.policy import default
 import torch as ch
 from torch.cuda.amp import GradScaler
 from torch.cuda.amp import autocast
@@ -81,7 +82,9 @@ Section('training', 'training hyper param stuff').params(
     label_smoothing=Param(float, 'label smoothing parameter', default=0.1),
     distributed=Param(int, 'is distributed?', default=0),
     use_blurpool=Param(int, 'use blurpool?', default=0),
-    seed=Param(int, "random seed for experiments", default=0)
+    seed=Param(int, "random seed for experiments", default=0),
+    frac_percent=Param(float, 'percentage to prune', default=0.1),
+    freq=Param(int, 'frequency to rescore', default=10)
 )
 
 Section('dist', 'distributed training options').params(
@@ -128,15 +131,16 @@ class BlurPoolConv2d(ch.nn.Module):
 
 class ImageNetTrainer:
     @param('training.distributed')
-    def __init__(self, gpu, distributed):
+    @param('training.seed')
+    def __init__(self, gpu, distributed, seed):
         self.all_params = get_current_config()
         self.gpu = gpu
-
         self.uid = str(uuid4())
 
         if distributed:
             self.setup_distributed()
-
+        ch.manual_seed(seed)
+        np.random.seed(seed)
         self.train_loader = self.create_train_loader()
         self.val_loader = self.create_val_loader()
         self.model, self.scaler = self.create_model_and_scaler()
@@ -238,6 +242,7 @@ class ImageNetTrainer:
         ]
 
         order = OrderOption.RANDOM if distributed else OrderOption.QUASI_RANDOM
+
         loader = Loader(train_dataset,
                         batch_size=batch_size,
                         num_workers=num_workers,
@@ -294,10 +299,16 @@ class ImageNetTrainer:
 
     @param('training.epochs')
     @param('logging.log_level')
-    @param('training.seed')
-    def train(self, epochs, log_level, seed):
-        ch.manual_seed(seed)
-        np.random.seed(seed)
+    @param('training.frac_percent')
+    @param('training.freq')
+    def train(self, epochs, log_level, frac_percent, freq):
+        total_num_samples = 1281167
+        pool = np.random.choice(np.arange(total_num_samples), int((1 - frac_percent) * total_num_samples), replace=False)
+        self.train_loader.indices = pool
+        self.train_loader.traversal_order.indices = pool
+        # new_args = {**self.train_loader._args}
+        # new_args['indices'] = pool
+        # self.train_loader = Loader(**new_args)
 
         start = time.time()
         for epoch in range(epochs):
@@ -312,6 +323,15 @@ class ImageNetTrainer:
                 }
 
                 self.eval_and_log(extra_dict)
+            if epoch != 0 and epoch % freq == 0:
+                pool = np.random.choice(np.arange(total_num_samples), int((1 - frac_percent) * total_num_samples), replace=False)
+                self.train_loader.indices = pool
+                self.train_loader.traversal_order.indices = pool
+                # new_args = {**self.train_loader._args}
+                # new_args['indices'] = pool
+                # self.train_loader = Loader(**new_args)
+
+
         total = time.time() - start
         # self.log(dict({'total time': total}))
 

@@ -6,7 +6,7 @@ dist:
   world_size: 1
 logging:
   folder: /tmp/
-  log_level: 0
+  log_level: 1
 lr:
   lr: 0.5
   lr_peak_epoch: 2
