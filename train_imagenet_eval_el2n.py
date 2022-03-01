@@ -33,7 +33,6 @@ from ffcv.transforms import ToTensor, ToDevice, Squeeze, NormalizeImage, \
 from ffcv.fields.rgb_image import CenterCropRGBImageDecoder, \
     RandomResizedCropRGBImageDecoder
 from ffcv.fields.basics import IntDecoder
-from ffcv.traversal_order import QuasiRandom, Random
 
 Section('model', 'model details').params(
     arch=Param(And(str, OneOf(models.__dir__())), default='resnet18'),
@@ -84,8 +83,7 @@ Section('training', 'training hyper param stuff').params(
     distributed=Param(int, 'is distributed?', default=0),
     use_blurpool=Param(int, 'use blurpool?', default=0),
     seed=Param(int, "random seed for experiments", default=0),
-    frac_percent=Param(float, 'percentage to prune', default=0.1),
-    freq=Param(int, 'frequency to rescore', default=10)
+    frac_percent=Param(float, "data pruning ratio", default=0.1)
 )
 
 Section('dist', 'distributed training options').params(
@@ -132,16 +130,15 @@ class BlurPoolConv2d(ch.nn.Module):
 
 class ImageNetTrainer:
     @param('training.distributed')
-    @param('training.seed')
-    def __init__(self, gpu, distributed, seed):
+    def __init__(self, gpu, distributed):
         self.all_params = get_current_config()
         self.gpu = gpu
+
         self.uid = str(uuid4())
 
         if distributed:
             self.setup_distributed()
-        ch.manual_seed(seed)
-        np.random.seed(seed)
+
         self.train_loader = self.create_train_loader()
         self.val_loader = self.create_val_loader()
         self.model, self.scaler = self.create_model_and_scaler()
@@ -218,8 +215,9 @@ class ImageNetTrainer:
     @param('training.batch_size')
     @param('training.distributed')
     @param('data.in_memory')
+    @param('training.frac_percent')
     def create_train_loader(self, train_dataset, num_workers, batch_size,
-                            distributed, in_memory):
+                            distributed, in_memory, frac_percent):
         this_device = f'cuda:{self.gpu}'
         train_path = Path(train_dataset)
         assert train_path.is_file()
@@ -242,12 +240,32 @@ class ImageNetTrainer:
             ToDevice(ch.device(this_device), non_blocking=True)
         ]
 
-        order = OrderOption.RANDOM if distributed else OrderOption.QUASI_RANDOM
+        # ------ do averaging logic here ----------- #
+        el2n_dict = {}
+        num_ensemble = 10
+        for i in range(num_ensemble):
+            with open(f'el2n_train/{i}/scores_el2n_{i}.json') as json_file:
+                scores = json.load(json_file)
+                el2n_dict[i] = scores
+        
+        num_examples = len(el2n_dict[0].values())
+        mean_scores = dict.fromkeys(range(num_examples), 0)
+        for i in range(num_examples):
+            for j in range(num_ensemble):
+                mean_scores[i] += el2n_dict[j][str(i)]
+            mean_scores[i] = mean_scores[i]/num_ensemble
+        el2n_values = np.array(list(mean_scores.values()))
+        threshold = np.percentile(el2n_values, int(frac_percent * 100.0))
+        scores = {int(key):val for key, val in mean_scores.items() if val > threshold}
+        el2n_indices = list(scores.keys())
 
+        # ------ do averaging logic here ----------- #
+        order = OrderOption.RANDOM if distributed else OrderOption.QUASI_RANDOM
         loader = Loader(train_dataset,
                         batch_size=batch_size,
                         num_workers=num_workers,
                         order=order,
+                        indices=el2n_indices,
                         os_cache=in_memory,
                         drop_last=False,
                         pipelines={
@@ -300,14 +318,10 @@ class ImageNetTrainer:
 
     @param('training.epochs')
     @param('logging.log_level')
-    @param('training.frac_percent')
-    @param('training.freq')
-    @param('training.distributed')
-    def train(self, epochs, log_level, frac_percent, freq, distributed):
-        total_num_samples = 1281167
-        pool = np.random.choice(np.arange(total_num_samples), int((1 - frac_percent) * total_num_samples), replace=False)
-        self.train_loader.indices = pool
-        self.train_loader.traversal_order = Random(self.train_loader) if distributed else QuasiRandom(self.train_loader)
+    @param('training.seed')
+    def train(self, epochs, log_level, seed):
+        ch.manual_seed(seed)
+        np.random.seed(seed)
 
         start = time.time()
         for epoch in range(epochs):
@@ -322,13 +336,9 @@ class ImageNetTrainer:
                 }
 
                 self.eval_and_log(extra_dict)
-            if epoch != 0 and epoch % freq == 0:
-                pool = np.random.choice(np.arange(total_num_samples), int((1 - frac_percent) * total_num_samples), replace=False)
-                self.train_loader.indices = pool
-                self.train_loader.traversal_order = Random(self.train_loader) if distributed else QuasiRandom(self.train_loader)
-
-
         total = time.time() - start
+        # self.log(dict({'total time': total}))
+
         self.eval_and_log({'epoch':epoch, 'total time': total})
         if self.gpu == 0:
             ch.save(self.model.state_dict(), self.log_folder / 'final_weights.pt')

@@ -1,4 +1,3 @@
-from email.policy import default
 import torch as ch
 from torch.cuda.amp import GradScaler
 from torch.cuda.amp import autocast
@@ -33,7 +32,7 @@ from ffcv.transforms import ToTensor, ToDevice, Squeeze, NormalizeImage, \
 from ffcv.fields.rgb_image import CenterCropRGBImageDecoder, \
     RandomResizedCropRGBImageDecoder
 from ffcv.fields.basics import IntDecoder
-from ffcv.traversal_order import QuasiRandom, Random
+from ffcv.traversal_order import Sequential
 
 Section('model', 'model details').params(
     arch=Param(And(str, OneOf(models.__dir__())), default='resnet18'),
@@ -83,9 +82,7 @@ Section('training', 'training hyper param stuff').params(
     label_smoothing=Param(float, 'label smoothing parameter', default=0.1),
     distributed=Param(int, 'is distributed?', default=0),
     use_blurpool=Param(int, 'use blurpool?', default=0),
-    seed=Param(int, "random seed for experiments", default=0),
-    frac_percent=Param(float, 'percentage to prune', default=0.1),
-    freq=Param(int, 'frequency to rescore', default=10)
+    seed=Param(int, "random seed for experiments", default=0)
 )
 
 Section('dist', 'distributed training options').params(
@@ -132,16 +129,15 @@ class BlurPoolConv2d(ch.nn.Module):
 
 class ImageNetTrainer:
     @param('training.distributed')
-    @param('training.seed')
-    def __init__(self, gpu, distributed, seed):
+    def __init__(self, gpu, distributed):
         self.all_params = get_current_config()
         self.gpu = gpu
+
         self.uid = str(uuid4())
 
         if distributed:
             self.setup_distributed()
-        ch.manual_seed(seed)
-        np.random.seed(seed)
+
         self.train_loader = self.create_train_loader()
         self.val_loader = self.create_val_loader()
         self.model, self.scaler = self.create_model_and_scaler()
@@ -243,7 +239,6 @@ class ImageNetTrainer:
         ]
 
         order = OrderOption.RANDOM if distributed else OrderOption.QUASI_RANDOM
-
         loader = Loader(train_dataset,
                         batch_size=batch_size,
                         num_workers=num_workers,
@@ -300,14 +295,10 @@ class ImageNetTrainer:
 
     @param('training.epochs')
     @param('logging.log_level')
-    @param('training.frac_percent')
-    @param('training.freq')
-    @param('training.distributed')
-    def train(self, epochs, log_level, frac_percent, freq, distributed):
-        total_num_samples = 1281167
-        pool = np.random.choice(np.arange(total_num_samples), int((1 - frac_percent) * total_num_samples), replace=False)
-        self.train_loader.indices = pool
-        self.train_loader.traversal_order = Random(self.train_loader) if distributed else QuasiRandom(self.train_loader)
+    @param('training.seed')
+    def train(self, epochs, log_level, seed):
+        ch.manual_seed(seed)
+        np.random.seed(seed)
 
         start = time.time()
         for epoch in range(epochs):
@@ -322,13 +313,9 @@ class ImageNetTrainer:
                 }
 
                 self.eval_and_log(extra_dict)
-            if epoch != 0 and epoch % freq == 0:
-                pool = np.random.choice(np.arange(total_num_samples), int((1 - frac_percent) * total_num_samples), replace=False)
-                self.train_loader.indices = pool
-                self.train_loader.traversal_order = Random(self.train_loader) if distributed else QuasiRandom(self.train_loader)
-
-
         total = time.time() - start
+        # self.log(dict({'total time': total}))
+
         self.eval_and_log({'epoch':epoch, 'total time': total})
         if self.gpu == 0:
             ch.save(self.model.state_dict(), self.log_folder / 'final_weights.pt')
@@ -413,6 +400,26 @@ class ImageNetTrainer:
                 iterator.set_description(msg)
             ### Logging end
 
+    @param('training.batch_size')
+    # assuming sequential loading
+    def scoring_loop(self, batch_size):
+        model = self.model
+        model.train()
+        iterator = tqdm(self.train_loader)
+        score_dict = {}
+
+        for ix, (images, target) in enumerate(iterator):
+            with autocast():
+                output = self.model(images)
+                output = ch.nn.functional.softmax(output)
+                batch_score_arr = ch.norm(output - F.one_hot(target, num_classes=1000), p=2, dim=-1)
+            num_samples = batch_score_arr.shape[0]
+            batch_score_arr = batch_score_arr.cpu().detach()
+            for index in range(num_samples):
+                score_dict[ix * batch_size + index] = batch_score_arr[index].item()
+        return score_dict
+
+
     @param('validation.lr_tta')
     def val_loop(self, lr_tta):
         model = self.model
@@ -470,6 +477,17 @@ class ImageNetTrainer:
             }) + '\n')
             fd.flush()
 
+    @param('training.seed')
+    def calculate_el2n_scores(self, seed):
+        # can change ordertype to sequential?
+        self.train_loader.traversal_order = Sequential(self.train_loader)
+        start = time.time()
+        score_dict = self.scoring_loop()
+        end = time.time()
+        print(f"scoring time: {end - start} s")
+        with open(f'./scores_el2n_{seed}.json', 'w+') as file:
+            json.dump(score_dict, file)
+        
     @classmethod
     @param('training.distributed')
     @param('dist.world_size')
@@ -493,6 +511,7 @@ class ImageNetTrainer:
             trainer.eval_and_log()
         else:
             trainer.train()
+            trainer.calculate_el2n_scores()
 
         if distributed:
             trainer.cleanup_distributed()
