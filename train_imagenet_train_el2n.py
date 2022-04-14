@@ -238,6 +238,10 @@ class ImageNetTrainer:
             ToDevice(ch.device(this_device), non_blocking=True)
         ]
 
+        idx_pipeline: List[Operation] = [
+            IntDecoder()
+        ]
+
         order = OrderOption.RANDOM if distributed else OrderOption.QUASI_RANDOM
         loader = Loader(train_dataset,
                         batch_size=batch_size,
@@ -247,7 +251,8 @@ class ImageNetTrainer:
                         drop_last=False,
                         pipelines={
                             'image': image_pipeline,
-                            'label': label_pipeline
+                            'label': label_pipeline,
+                            'idx': idx_pipeline
                         },
                         distributed=distributed)
 
@@ -367,7 +372,7 @@ class ImageNetTrainer:
         lrs = np.interp(np.arange(iters), [0, iters], [lr_start, lr_end])
 
         iterator = tqdm(self.train_loader)
-        for ix, (images, target) in enumerate(iterator):
+        for ix, (images, target, idx) in enumerate(iterator):
             ### Training start
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lrs[ix]
@@ -408,7 +413,7 @@ class ImageNetTrainer:
         iterator = tqdm(self.train_loader)
         score_dict = {}
 
-        for ix, (images, target) in enumerate(iterator):
+        for ix, (images, target, idx) in enumerate(iterator):
             with autocast():
                 output = self.model(images)
                 output = ch.nn.functional.softmax(output)
@@ -416,7 +421,8 @@ class ImageNetTrainer:
             num_samples = batch_score_arr.shape[0]
             batch_score_arr = batch_score_arr.cpu().detach()
             for index in range(num_samples):
-                score_dict[ix * batch_size + index] = batch_score_arr[index].item()
+                sample_idx = idx[index].item()
+                score_dict[sample_idx] = batch_score_arr[index].item()
         return score_dict
 
 
@@ -479,8 +485,6 @@ class ImageNetTrainer:
 
     @param('training.seed')
     def calculate_el2n_scores(self, seed):
-        # can change ordertype to sequential?
-        self.train_loader.traversal_order = Sequential(self.train_loader)
         start = time.time()
         score_dict = self.scoring_loop()
         end = time.time()
