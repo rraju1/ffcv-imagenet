@@ -244,6 +244,10 @@ class ImageNetTrainer:
             ToDevice(ch.device(this_device), non_blocking=True)
         ]
 
+        idx_pipeline: List[Operation] = [
+            IntDecoder()
+        ]
+
         order = OrderOption.RANDOM if distributed else OrderOption.QUASI_RANDOM
 
         loader = Loader(train_dataset,
@@ -254,7 +258,8 @@ class ImageNetTrainer:
                         drop_last=False,
                         pipelines={
                             'image': image_pipeline,
-                            'label': label_pipeline
+                            'label': label_pipeline,
+                            'idx': idx_pipeline
                         },
                         distributed=distributed)
 
@@ -318,6 +323,8 @@ class ImageNetTrainer:
         self.train_loader.indices = pool
         self.train_loader.traversal_order = Random(self.train_loader) if distributed else QuasiRandom(self.train_loader)
         self.increment_scores(counts_dict, pool)
+        # score_dict = self.score_ema_eps(score_dict, counts_dict)
+        # print(f'first score function done')
 
         for epoch in range(epochs):
             res = self.get_resolution(epoch)
@@ -331,9 +338,10 @@ class ImageNetTrainer:
                 }
 
                 self.eval_and_log(extra_dict)
-            if epoch != 0 and epoch % freq == 0:
+            # if epoch != 0 and epoch % freq == 0:
+            if epoch % freq == 0:
+                print(f'scoring samples')
                 score_dict = self.score_ema_eps(score_dict, counts_dict)
-
 
         total = time.time() - start
         self.eval_and_log({'epoch':epoch, 'total time': total})
@@ -354,8 +362,8 @@ class ImageNetTrainer:
         self.train_loader.indices = np.arange(total_num_samples)
         self.train_loader.traversal_order = Sequential(self.train_loader)
         score_dict = self.scoring_loop()
-        # self.ema(score_dict, prev_scores_dict)
-        
+        self.ema(score_dict, prev_scores_dict)
+        # --------------------------------------------
         keep_set_samples = int(total_num_samples * (1 - frac_percent))
         eps_budget = keep_set_samples * eps
         lower_bound = total_num_samples * (frac_percent)
@@ -363,19 +371,26 @@ class ImageNetTrainer:
         # print(f'eps budget: {eps_budget}')
         # print(f'lower bound in percentile: {eps_budget + lower_bound}')
         # print(f'lower bound in percentile: {100*(eps_budget + lower_bound)/total_num_samples}')
-
-        threshold = np.percentile(np.array(list(score_dict.values())), int(((lower_bound + eps_budget)/total_num_samples) * 100.0))
+        # --------------------------------------------
+        # threshold = np.percentile(np.array(list(score_dict.values())), int(frac_percent * 100.0))
+        adjusted_eps_lower_bound = int(((lower_bound + eps_budget)/total_num_samples) * 100.0)
+        threshold = np.percentile(np.array(list(score_dict.values())), adjusted_eps_lower_bound)
         threshold_scores = {key:val for key, val in score_dict.items() if val > threshold}
-        # print(np.array(list(threshold_scores.keys())).shape)
-        rand_samples = np.random.choice(np.setdiff1d(np.arange(total_num_samples),threshold_scores.keys()), int(keep_set_samples - len(list(threshold_scores.keys()))))
-        # print(rand_samples.shape)
-        pool = np.concatenate((rand_samples, np.array(list(threshold_scores.keys()))))
-        # list_samples = np.concatenate((rand_samples, np.array(list(scores.keys()))))
-        # print(f'pool: {pool.shape}')
-        # pool = np.array(list(threshold_scores.keys()))
+        # --------------------------------------------
+        leftover_pool = np.setdiff1d(np.arange(total_num_samples),np.array(list(threshold_scores.keys())))
+        rand_samples = np.random.choice(leftover_pool, int(keep_set_samples - len(list(threshold_scores.keys()))), replace=False)
+        # print(f'random sampled pool: {rand_samples.shape}, {rand_samples.dtype}')
+        pool = np.array(list(threshold_scores.keys()))
+        # print(f'pool: {pool.shape}, {pool.dtype}')
+        pool = np.concatenate((rand_samples, pool)) # --- added line -- doesn't work
+        # pool = np.hstack((rand_samples, pool)) # --- added line -- doesn't work
+        # print(f'added pool: {pool.shape}, {pool.dtype}')
+        # pool = np.random.choice(np.arange(total_num_samples), int((1 - frac_percent) * total_num_samples), replace=False)
+        print(pool)
         self.increment_scores(count_dict, pool)
         self.train_loader.indices = pool
         self.train_loader.traversal_order = Random(self.train_loader) if distributed else QuasiRandom(self.train_loader)
+        score_dict = prev_scores_dict
         return score_dict
  
     @param('training.alpha')
@@ -430,7 +445,7 @@ class ImageNetTrainer:
         lrs = np.interp(np.arange(iters), [0, iters], [lr_start, lr_end])
 
         iterator = tqdm(self.train_loader)
-        for ix, (images, target) in enumerate(iterator):
+        for ix, (images, target, idx) in enumerate(iterator):
             ### Training start
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lrs[ix]
@@ -475,7 +490,7 @@ class ImageNetTrainer:
         score_fn = ch.nn.CrossEntropyLoss(reduction='none') # apply cross-entropy loss
 
         with ch.no_grad():
-            for ix, (images, target) in enumerate(iterator):
+            for ix, (images, target, idx) in enumerate(iterator):
                 with autocast():
                     output = self.model(images) 
                     batch_score_arr = score_fn(output, target)
