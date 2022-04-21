@@ -244,6 +244,10 @@ class ImageNetTrainer:
             ToDevice(ch.device(this_device), non_blocking=True)
         ]
 
+        idx_pipeline: List[Operation] = [
+            IntDecoder()
+        ]
+
         order = OrderOption.RANDOM if distributed else OrderOption.QUASI_RANDOM
 
         loader = Loader(train_dataset,
@@ -254,7 +258,8 @@ class ImageNetTrainer:
                         drop_last=False,
                         pipelines={
                             'image': image_pipeline,
-                            'label': label_pipeline
+                            'label': label_pipeline,
+                            'idx': idx_pipeline
                         },
                         distributed=distributed)
 
@@ -351,7 +356,7 @@ class ImageNetTrainer:
     def score_ema_var(self, prev_scores_dict, count_dict, prev_var, frac_percent, distributed):
         total_num_samples = 1281167
         self.train_loader.indices = np.arange(total_num_samples)
-        self.train_loader.traversal_order = Sequential(self.train_loader)
+        self.train_loader.traversal_order = Random(self.train_loader) if distributed else QuasiRandom(self.train_loader)
         score_dict = self.scoring_loop()
         score_dict, scores_var, ucb = self.calc_var_scores(score_dict, prev_scores_dict, prev_var)
         threshold = np.percentile(np.array(list(ucb.values())), int(frac_percent * 100.0))
@@ -422,7 +427,7 @@ class ImageNetTrainer:
         lrs = np.interp(np.arange(iters), [0, iters], [lr_start, lr_end])
 
         iterator = tqdm(self.train_loader)
-        for ix, (images, target) in enumerate(iterator):
+        for ix, (images, target, idx) in enumerate(iterator):
             ### Training start
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lrs[ix]
@@ -467,14 +472,15 @@ class ImageNetTrainer:
         score_fn = ch.nn.CrossEntropyLoss(reduction='none') # apply cross-entropy loss
 
         with ch.no_grad():
-            for ix, (images, target) in enumerate(iterator):
+            for ix, (images, target, idx) in enumerate(iterator):
                 with autocast():
                     output = self.model(images) 
                     batch_score_arr = score_fn(output, target)
                 num_samples = batch_score_arr.shape[0]
                 batch_score_arr = batch_score_arr.cpu().detach()
                 for index in range(num_samples):
-                    score_dict[ix * batch_size + index] = batch_score_arr[index].item()
+                    sample_idx = idx[index].item()
+                    score_dict[sample_idx] = batch_score_arr[index].item()
         return score_dict
 
     @param('validation.lr_tta')
