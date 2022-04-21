@@ -354,13 +354,12 @@ class ImageNetTrainer:
     def score_ema(self, prev_scores_dict, count_dict, frac_percent, distributed):
         total_num_samples = 1281167
         self.train_loader.indices = np.arange(total_num_samples)
-        self.train_loader.traversal_order = Sequential(self.train_loader)
+        self.train_loader.traversal_order = Random(self.train_loader) if distributed else QuasiRandom(self.train_loader)
         score_dict = self.scoring_loop()
         self.ema(score_dict, prev_scores_dict)
         threshold = np.percentile(np.array(list(score_dict.values())), int(frac_percent * 100.0))
         threshold_scores = {key:val for key, val in score_dict.items() if val > threshold}
         pool = np.array(list(threshold_scores.keys()))
-        print(f'pool: {pool.shape}')
         self.increment_scores(count_dict, pool)
         self.train_loader.indices = pool
         self.train_loader.traversal_order = Random(self.train_loader) if distributed else QuasiRandom(self.train_loader)
@@ -470,7 +469,8 @@ class ImageNetTrainer:
                 num_samples = batch_score_arr.shape[0]
                 batch_score_arr = batch_score_arr.cpu().detach()
                 for index in range(num_samples):
-                    score_dict[idx] = batch_score_arr[index].item()
+                    sample_idx = idx[index].item()
+                    score_dict[sample_idx] = batch_score_arr[index].item()
         return score_dict
 
     @param('validation.lr_tta')
