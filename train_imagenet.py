@@ -237,6 +237,10 @@ class ImageNetTrainer:
             ToDevice(ch.device(this_device), non_blocking=True)
         ]
 
+        idx_pipeline: List[Operation] = [
+            IntDecoder()
+        ]
+
         order = OrderOption.RANDOM if distributed else OrderOption.QUASI_RANDOM
         loader = Loader(train_dataset,
                         batch_size=batch_size,
@@ -246,7 +250,8 @@ class ImageNetTrainer:
                         drop_last=False,
                         pipelines={
                             'image': image_pipeline,
-                            'label': label_pipeline
+                            'label': label_pipeline,
+                            'idx': idx_pipeline
                         },
                         distributed=distributed)
 
@@ -366,7 +371,7 @@ class ImageNetTrainer:
         lrs = np.interp(np.arange(iters), [0, iters], [lr_start, lr_end])
 
         iterator = tqdm(self.train_loader)
-        for ix, (images, target) in enumerate(iterator):
+        for ix, (images, target, idx) in enumerate(iterator):
             ### Training start
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lrs[ix]
