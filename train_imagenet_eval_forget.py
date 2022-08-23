@@ -245,6 +245,11 @@ class ImageNetTrainer:
         ]
         with open(f'forgot_{seed}.json') as json_file:
             forget_scores = json.load(json_file)
+
+        # total_num_samples = 1281167
+        # ordered_forget = {int(k): v for k, v in sorted(forget_scores.items(), key=lambda item: item[1], reverse=True)}
+        # num_samples = int(total_num_samples * (1 - frac_percent))
+        # forget_indices = list(ordered_forget.keys())[:num_samples]
         forget_values = np.array(list(forget_scores.values()))
         threshold = np.percentile(forget_values, int(frac_percent * 100.0))
         scores = {int(key):val for key, val in forget_scores.items() if val > threshold}
